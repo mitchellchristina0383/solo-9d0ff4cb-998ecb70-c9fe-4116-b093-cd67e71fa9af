@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>配电支路检修 · 数据库集群断电演练</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div class="wrap topbar-inner">
+    <div>
+      <h1>机房配电检修演练台</h1>
+      <p class="sub">三副本数据库集群 · 双路供电 · 超载连锁跳闸 · 启动编号防旧报</p>
+    </div>
+    <div class="sample-switch">
+      {% for sid in sample_ids %}
+      <form method="post" action="{{ url_for('ui_load_sample', sample_id=sid) }}">
+        <button class="btn {% if v.sample.id == sid %}btn-primary{% else %}btn-ghost{% endif %}" type="submit">
+          {{ '当前：' if v.sample.id == sid else '载入' }}{{ sid == 'cross' and '样例一' or '样例二' }}
+        </button>
+      </form>
+      {% endfor %}
+      <form method="post" action="{{ url_for('ui_reset') }}" onsubmit="return confirm('确认复位当前演练？所有跳闸、启动编号和就绪状态将回到初始健康状态。');">
+        <input type="hidden" name="sample" value="{{ v.sample.id }}">
+        <button class="btn btn-warn" type="submit">复位演练</button>
+      </form>
+    </div>
+  </div>
+</header>
+
+<main class="wrap" id="drill-top">
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <section class="flashes">
+        {% for category, msg in messages %}
+          <div class="flash flash-{{ category }}">{{ msg }}</div>
+        {% endfor %}
+      </section>
+    {% endif %}
+  {% endwith %}
+
+  <!-- 集群可用性总览 -->
+  <section class="cluster-banner {{ 'is-up' if v.cluster.available else 'is-down' }}">
+    <div class="cluster-light" aria-hidden="true"></div>
+    <div class="cluster-main">
+      <div class="cluster-title">
+        {% if v.cluster.available %}数据库集群可用（至少 {{ v.cluster.required_ready }} 副本就绪）
+        {% else %}数据库集群不可用（就绪副本不足 {{ v.cluster.required_ready }} 个）{% endif %}
+      </div>
+      <div class="cluster-nums">
+        <span><b>{{ v.cluster.ready_count }}</b>/3 副本就绪</span>
+        <span><b>{{ v.cluster.powered_count }}</b>/3 服务器有电</span>
+        <span class="rule">判定规则：就绪副本 ≥ {{ v.cluster.required_ready }} 才显示可用</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 当前样例说明 + 操作指引 -->
+  <section class="card sample-card">
+    <div class="card-h">
+      <h2>{{ v.sample.name }}</h2>
+      <span class="tag">{{ v.sample.subtitle }}</span>
+    </div>
+    <p class="desc">{{ v.sample.description }}</p>
+    <details open>
+      <summary>值班员操作指引（黄金路径）</summary>
+      <ol class="golden">
+        {% for step in v.sample.golden_path %}<li>{{ step }}</li>{% endfor %}
+      </ol>
+    </details>
+    <p class="power-note">单机整机功耗 <b>{{ v.server_power_w }} W</b>：双路正常时每路分摊 50%，只剩一路时该路承担 100%。</p>
+  </section>
+
+  <div class="grid-main">
+    <!-- 支路配电盘 -->
+    <section class="card">
+      <div class="card-h">
+        <h2>配电支路（标明功率上限）</h2>
+        <form id="closeManyForm" method="post" action="{{ url_for('ui_close_many') }}" class="inline">
+          <button class="btn btn-primary btn-sm" type="submit">同时合闸勾选支路</button>
+        </form>
+      </div>
+
+      <div class="branch-list">
+        {% for b in v.branches %}
+        <article class="branch {{ 'b-trip' if b.tripped }} {{ 'b-open' if not b.closed }}">
+          <div class="branch-head">
+            <label class="branch-pick" title="勾选后可并列合闸">
+              <input type="checkbox" name="ids" value="{{ b.id }}" form="closeManyForm"
+                     {% if b.closed %}disabled{% endif %}>
+            </label>
+            <div class="branch-name">
+              <span class="bid">{{ b.id }}</span>
+              <span class="blabel">{{ b.label }}</span>
+            </div>
+            <div class="branch-status">
+              {% if b.closed %}
+                <span class="badge badge-closed">合闸中</span>
+              {% elif b.tripped %}
+                <span class="badge badge-trip">超载跳闸 · 待手动合闸</span>
+              {% else %}
+                <span class="badge badge-manual">人工断开</span>
+              {% endif %}
+            </div>
+          </div>
+
+          <div class="branch-meta">
+            <span>功率上限 <b>{{ b.capacity_w }} W</b>（{{ b.capacity_kw }} kW）</span>
+            <span>当前负载 <b class="{{ 'txt-over' if b.load_state == 'over' }}">{{ b.load_w }} W</b>（{{ b.load_kw }} kW）</span>
+            <span>负载率 {{ (b.ratio * 100) | round(0, 'floor') }}%</span>
+          </div>
+          <div class="bar {{ 'bar-over' if b.load_state == 'over' else 'bar-full' if b.load_state == 'full' else '' }}">
+            <i style="width: {{ (b.ratio * 100) | round | int }}%"></i>
+          </div>
+          <p class="hint">{{ b.hint }}</p>
+
+          <div class="feeds">
+            {% for f in b.feeds %}
+              <span class="feed {{ 'feed-dead' if not f.feed_closed }}">
+                {{ f.server_name }} · {{ f.module }}
+              </span>
+            {% endfor %}
+          </div>
+
+          <div class="branch-actions">
+            {% if b.closed %}
+            <form method="post" action="{{ url_for('ui_disconnect', branch_id=b.id) }}" class="inline">
+              <button class="btn btn-danger btn-sm" type="submit">断开 {{ b.id }}</button>
+            </form>
+            {% else %}
+            <form method="post" action="{{ url_for('ui_close', branch_id=b.id) }}" class="inline">
+              <button class="btn btn-primary btn-sm" type="submit">合闸 {{ b.id }}</button>
+            </form>
+            {% endif %}
+          </div>
+        </article>
+        {% endfor %}
+      </div>
+    </section>
+
+    <!-- 三副本状态 -->
+    <section class="card">
+      <div class="card-h"><h2>数据库副本状态</h2></div>
+      <div class="replica-list">
+        {% for s in v.servers %}
+        <article class="replica {{ 'r-off' if not s.powered }} {{ 'r-ready' if s.ready }}">
+          <header class="replica-head">
+            <div>
+              <span class="bid">{{ s.id }}</span>
+              <span class="role">{{ s.role }}</span>
+            </div>
+            {% if s.powered %}
+              <span class="badge badge-power">有电</span>
+            {% else %}
+              <span class="badge badge-off">掉电</span>
+            {% endif %}
+          </header>
+
+          <div class="replica-grid">
+            <div>
+              <div class="k">启动编号</div>
+              <div class="boot-no">#{{ s.boot_no }}</div>
+              {% if s.powered and s.boot_no > 1 %}<span class="badge badge-new">复电后的新启动编号</span>{% endif %}
+            </div>
+            <div>
+              <div class="k">就绪状态</div>
+              {% if s.ready %}
+                <div class="ready-yes">就绪 ✓</div>
+                <div class="tiny">确认于 #{{ s.ready_boot_no }}</div>
+              {% else %}
+                <div class="ready-no">未就绪</div>
+              {% endif %}
+            </div>
+          </div>
+
+          <div class="feed-lines">
+            {% for f in s.feeds %}
+              <span class="feed {{ 'feed-dead' if not f.closed }}">
+                {{ f.module }} → {{ f.branch_id }} {{ '合' if f.closed else '分' }}
+              </span>
+            {% endfor %}
+            <span class="feed-rule">两路都断才掉电</span>
+          </div>
+
+          <form method="post" action="{{ url_for('ui_ready', server_id=s.id) }}" class="ready-form">
+            <label class="tiny" for="boot-{{ s.id }}">上报携带启动编号</label>
+            <div class="ready-row">
+              <input id="boot-{{ s.id }}" name="boot_no" type="number"
+                     value="{{ s.boot_no }}" min="0" step="1"
+                     {{ 'disabled' if not s.powered }}>
+              <button class="btn btn-primary btn-sm" type="submit"
+                      {{ 'disabled' if not s.powered }}>确认就绪</button>
+              <button class="btn btn-stale btn-sm" type="submit" name="mode" value="stale"
+                      title="故意使用上一个启动编号上报">用旧编号试报</button>
+            </div>
+            {% if not s.powered %}<p class="tiny txt-over">服务器掉电中，任何就绪上报都会被拒绝。</p>{% endif %}
+          </form>
+        </article>
+        {% endfor %}
+      </div>
+    </section>
+  </div>
+
+  <div class="grid-bottom">
+    <!-- 本次演练：操作与每轮跳闸 -->
+    <section class="card">
+      <div class="card-h"><h2>本次操作 · 每轮跳闸支路</h2></div>
+      {% if not v.operations %}
+        <p class="empty">尚未进行支路操作。断开推荐检修支路后，这里按轮次列出同时跳闸的支路。</p>
+      {% endif %}
+      <ol class="op-list">
+        {% for op in v.operations %}
+        <li class="op">
+          <div class="op-head">
+            <span class="op-seq">#{{ op.seq }}</span>
+            <span class="op-time">{{ op.at }}</span>
+            <span class="badge badge-kind">
+              {% if op.kind == 'disconnect' %}人工断开
+              {% elif op.kind == 'close' %}手动合闸
+              {% else %}并列合闸{% endif %}
+            </span>
+            <span class="op-targets">{{ op.targets | join('、') }}</span>
+          </div>
+
+          {% if op.rounds %}
+            <div class="rounds">
+              {% for r in op.rounds %}
+              <div class="round">
+                <span class="round-tag">第 {{ r.index }} 轮 · 同时跳闸</span>
+                {% for t in r.tripped %}
+                  <span class="chip-trip">
+                    {{ t.branch }}
+                    <em>{{ t.load_w }}W &gt; 上限 {{ t.capacity_w }}W</em>
+                  </span>
+                {% endfor %}
+              </div>
+              {% endfor %}
+              <div class="round-note">已按剩余支路重算至无超载。跳闸支路不会自动重合，须手动合闸。</div>
+            </div>
+          {% else %}
+            <div class="no-trip">本次操作未产生超载跳闸。</div>
+          {% endif %}
+
+          {% if op.power_events %}
+          <div class="power-events">
+            {% for ev in op.power_events %}
+              {% if ev.type == 'power_lost' %}
+                <span class="chip-off">{{ ev.server }} 两路全断 · 掉电</span>
+              {% else %}
+                <span class="chip-on">{{ ev.server }} 复电 · 新启动编号 #{{ ev.boot_no }}</span>
+              {% endif %}
+            {% endfor %}
+          </div>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ol>
+    </section>
+
+    <!-- 就绪上报记录 -->
+    <section class="card">
+      <div class="card-h"><h2>就绪上报校验记录</h2></div>
+      {% if not v.reports %}
+        <p class="empty">还没有就绪上报。尝试“确认就绪”或“用旧编号试报”，此处显示是否被接受。</p>
+      {% else %}
+      <ul class="report-list">
+        {% for r in v.reports %}
+        <li class="report {{ 'rep-ok' if r.accepted else 'rep-bad' }}">
+          <div class="report-head">
+            <span class="op-time">{{ r.at }}</span>
+            <b>{{ r.server }}</b>
+            {% if r.accepted %}<span class="badge badge-accept">已接受 #{{ r.sent_boot_no }}</span>
+            {% elif r.code == 'stale_boot' %}<span class="badge badge-reject">旧编号 #{{ r.sent_boot_no }} 被拒（当前 #{{ r.current_boot_no }}）</span>
+            {% else %}<span class="badge badge-reject">掉电中 · 被拒</span>{% endif %}
+          </div>
+          <p class="report-msg">{{ r.message }}</p>
+        </li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </section>
+  </div>
+
+  <footer class="foot">
+    <p>JSON API：<code>GET /api/state</code> · <code>POST /api/branches/&lt;id&gt;/disconnect|close</code>
+       · <code>POST /api/branches/close-many</code> · <code>POST /api/replicas/&lt;id&gt;/ready</code>
+       · <code>POST /api/reset</code></p>
+  </footer>
+</main>
+<script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</body>
+</html>
