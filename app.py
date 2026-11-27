@@ -3,14 +3,18 @@
 页面：GET /
 JSON API：
   GET  /api/state
-  POST /api/reset                      {"sample": "cross"|"chain"}
+  POST /api/reset                      {"sample": "cross"|"chain"|"ups"}
   POST /api/branches/<bid>/disconnect
   POST /api/branches/<bid>/close
   POST /api/branches/close-many        {"ids": ["WL3","WL4"]}
   POST /api/replicas/<sid>/ready       {"boot_no": 2} 或 {"stale": true}
+  POST /api/ups/<bid>/upstream         {"on": true|false}   （仅 UPS 教案）
+  POST /api/advance                    {"seconds": 30}      （仅 UPS 教案）
 
 HTML 表单走 /ui/... 路由，flash 后 PRG 重定向回页面。
 演练状态保存在单进程内存中，因此 gunicorn 必须使用 1 个 worker。
+所有状态变更（含一次推进的全部分段结算）都在同一把 RLock 内完成：
+分合闸与就绪上报只能作用于一次推进之前或推进完成之后的状态。
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ from flask import (
     url_for,
 )
 
-from power_model import Drill
+from power_model import Drill, RuleError
 from samples import DEFAULT_SAMPLE, SAMPLES, get_sample
 
 app = Flask(__name__)
@@ -53,7 +57,11 @@ def _reset(sample_id: str | None) -> Drill:
 def index():
     with _LOCK:
         view = _STATE.view()
-    return render_template("index.html", v=view, sample_ids=list(SAMPLES.keys()))
+    sample_list = [
+        {"id": s["id"], "short": s.get("short", s["name"])}
+        for s in SAMPLES.values()
+    ]
+    return render_template("index.html", v=view, sample_list=sample_list)
 
 
 @app.get("/healthz")
@@ -98,6 +106,11 @@ def api_close(branch_id: str):
             op = _STATE.close(branch_id)
         except KeyError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 404
+        except RuleError as exc:
+            return (
+                jsonify({"ok": False, "code": "close_blocked", "error": str(exc)}),
+                409,
+            )
         return jsonify({"ok": True, "operation": op, "state": _STATE.view()})
 
 
@@ -108,7 +121,49 @@ def api_close_many():
     if isinstance(ids, str):
         ids = [ids]
     with _LOCK:
-        op = _STATE.close_many(ids)
+        try:
+            op = _STATE.close_many(ids)
+        except RuleError as exc:
+            return (
+                jsonify({"ok": False, "code": "close_blocked", "error": str(exc)}),
+                409,
+            )
+        return jsonify({"ok": True, "operation": op, "state": _STATE.view()})
+
+
+def _parse_on(raw) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "on", "yes")
+
+
+@app.post("/api/ups/<branch_id>/upstream")
+def api_upstream(branch_id: str):
+    data = request.get_json(silent=True) or {}
+    raw = data.get("on", request.form.get("on"))
+    if raw is None:
+        return jsonify({"ok": False, "error": "缺少 on 参数（true/false）"}), 400
+    with _LOCK:
+        try:
+            op = _STATE.set_upstream(branch_id, _parse_on(raw))
+        except KeyError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 404
+        return jsonify({"ok": True, "operation": op, "state": _STATE.view()})
+
+
+@app.post("/api/advance")
+def api_advance():
+    data = request.get_json(silent=True) or {}
+    raw = data.get("seconds", request.form.get("seconds"))
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "seconds 必须是数字"}), 400
+    with _LOCK:
+        try:
+            op = _STATE.advance(seconds)
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
         return jsonify({"ok": True, "operation": op, "state": _STATE.view()})
 
 
@@ -202,6 +257,9 @@ def ui_close(branch_id: str):
         except KeyError:
             flash(f"未知支路 {branch_id}", "err")
             return _back()
+        except RuleError as exc:
+            flash(str(exc), "err")
+            return _back()
     if op["rounds"]:
         names = [
             "、".join(t["branch"] for t in r["tripped"]) for r in op["rounds"]
@@ -221,13 +279,79 @@ def ui_close(branch_id: str):
 def ui_close_many():
     ids = request.form.getlist("ids")
     with _LOCK:
-        op = _STATE.close_many(ids)
+        try:
+            op = _STATE.close_many(ids)
+        except RuleError as exc:
+            flash(str(exc), "err")
+            return _back()
     if not ids:
         flash("未勾选任何支路。", "err")
     elif op["rounds"]:
         flash("并列合闸后仍有超载跳闸，请核对容量。", "err")
     else:
         flash("已同时合闸：" + "、".join(op["targets"]) + "，未再跳闸。", "ok")
+    return _back()
+
+
+def _events_text(events) -> str:
+    """把推进/断上游产生的耗尽事件压缩成一句中文摘要。"""
+    parts = []
+    for ev in events:
+        seg = f"时钟 {ev['at']}s " + "、".join(ev["branches"]) + " 电池耗尽自动断开"
+        trips = [t["branch"] for r in ev["rounds"] for t in r["tripped"]]
+        if trips:
+            seg += "，连锁跳闸 " + "、".join(trips)
+        lost = [p["server"] for p in ev["power_events"] if p["type"] == "power_lost"]
+        if lost:
+            seg += "，掉电 " + "、".join(lost)
+        parts.append(seg)
+    return "；".join(parts) + "。"
+
+
+@app.post("/ui/ups/<branch_id>/upstream")
+def ui_upstream(branch_id: str):
+    on = request.form.get("on") == "1"
+    with _LOCK:
+        try:
+            op = _STATE.set_upstream(branch_id, on)
+        except KeyError:
+            flash(f"支路 {branch_id} 不存在或未配置 UPS。", "err")
+            return _back()
+    if on:
+        flash(
+            f"已恢复 {branch_id} 上游供电（电池电量不回升）；"
+            "支路不会自动合闸，请手动合闸。",
+            "ok",
+        )
+    elif op["events"]:
+        flash(f"已断开 {branch_id} 上游供电；" + _events_text(op["events"]), "trip")
+    else:
+        flash(f"已断开 {branch_id} 上游供电，UPS 电池开始按支路负载扣电。", "ok")
+    return _back()
+
+
+@app.post("/ui/advance")
+def ui_advance():
+    raw = request.form.get("seconds", "")
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        flash("推进秒数必须是数字。", "err")
+        return _back()
+    with _LOCK:
+        try:
+            op = _STATE.advance(seconds)
+        except ValueError as exc:
+            flash(str(exc), "err")
+            return _back()
+    head = (
+        f"已推进 {op['seconds']}s"
+        f"（演练时钟 {op['clock_from']}s → {op['clock_to']}s）"
+    )
+    if op["events"]:
+        flash(head + "：" + _events_text(op["events"]), "trip")
+    else:
+        flash(head + "，期间无电池耗尽。", "ok")
     return _back()
 
 

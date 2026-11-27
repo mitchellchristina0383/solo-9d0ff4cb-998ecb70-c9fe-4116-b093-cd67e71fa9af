@@ -11,13 +11,13 @@
   <div class="wrap topbar-inner">
     <div>
       <h1>机房配电检修演练台</h1>
-      <p class="sub">三副本数据库集群 · 双路供电 · 超载连锁跳闸 · 启动编号防旧报</p>
+      <p class="sub">三副本数据库集群 · 双路供电 · 超载连锁跳闸 · 启动编号防旧报 · UPS 电池续航推进</p>
     </div>
     <div class="sample-switch">
-      {% for sid in sample_ids %}
-      <form method="post" action="{{ url_for('ui_load_sample', sample_id=sid) }}">
-        <button class="btn {% if v.sample.id == sid %}btn-primary{% else %}btn-ghost{% endif %}" type="submit">
-          {{ '当前：' if v.sample.id == sid else '载入' }}{{ sid == 'cross' and '样例一' or '样例二' }}
+      {% for s in sample_list %}
+      <form method="post" action="{{ url_for('ui_load_sample', sample_id=s.id) }}">
+        <button class="btn {% if v.sample.id == s.id %}btn-primary{% else %}btn-ghost{% endif %}" type="submit">
+          {{ '当前：' if v.sample.id == s.id else '载入' }}{{ s.short }}
         </button>
       </form>
       {% endfor %}
@@ -73,6 +73,32 @@
     <p class="power-note">单机整机功耗 <b>{{ v.server_power_w }} W</b>：双路正常时每路分摊 50%，只剩一路时该路承担 100%。</p>
   </section>
 
+  {% if v.has_ups %}
+  <!-- 演练时钟与 UPS 续航推进 -->
+  <section class="card clock-card">
+    <div class="card-h">
+      <h2>演练时钟 · UPS 续航推进</h2>
+      <span class="tag">当前时钟 <b class="clock-now">{{ v.clock_s }} s</b></span>
+    </div>
+    <div class="advance-row">
+      <form method="post" action="{{ url_for('ui_advance') }}" class="advance-form">
+        <label for="adv-seconds">推进秒数</label>
+        <input id="adv-seconds" name="seconds" type="number" min="1" max="86400" step="1" value="20" required>
+        <button class="btn btn-primary" type="submit">推进时间</button>
+      </form>
+      {% for preset in [10, 20, 30, 60] %}
+      <form method="post" action="{{ url_for('ui_advance') }}" class="inline">
+        <input type="hidden" name="seconds" value="{{ preset }}">
+        <button class="btn btn-sm" type="submit">+{{ preset }}s</button>
+      </form>
+      {% endfor %}
+    </div>
+    <p class="hint">上游断电时由 UPS 接着供电，按支路负载扣电（电量 -= 负载 × 秒）；上游有电时电量不变（不模拟充电）。
+      电池耗尽的支路在同一时刻一起自动断开，再按超载规则结算跳闸与副本状态，剩余时间按新负载扣电；
+      分次推进与一次推进的剩余电量、支路状态和耗尽时刻一致。</p>
+  </section>
+  {% endif %}
+
   <div class="grid-main">
     <!-- 支路配电盘 -->
     <section class="card">
@@ -89,7 +115,7 @@
           <div class="branch-head">
             <label class="branch-pick" title="勾选后可并列合闸">
               <input type="checkbox" name="ids" value="{{ b.id }}" form="closeManyForm"
-                     {% if b.closed %}disabled{% endif %}>
+                     {% if b.closed or b.close_blocked %}disabled{% endif %}>
             </label>
             <div class="branch-name">
               <span class="bid">{{ b.id }}</span>
@@ -100,6 +126,8 @@
                 <span class="badge badge-closed">合闸中</span>
               {% elif b.tripped %}
                 <span class="badge badge-trip">超载跳闸 · 待手动合闸</span>
+              {% elif b.open_reason == 'battery' %}
+                <span class="badge badge-trip">电池耗尽 · 自动断开</span>
               {% else %}
                 <span class="badge badge-manual">人工断开</span>
               {% endif %}
@@ -116,6 +144,34 @@
           </div>
           <p class="hint">{{ b.hint }}</p>
 
+          {% if b.ups %}
+          <div class="ups-box {{ 'ups-empty' if b.ups.exhausted }}">
+            <div class="ups-line">
+              <span class="ups-name">🔋 {{ b.ups.label }}</span>
+              {% if b.ups.upstream_on %}
+                <span class="badge badge-closed">上游供电中</span>
+              {% elif b.ups.exhausted %}
+                <span class="badge badge-trip">上游断电 · 电池耗尽</span>
+              {% else %}
+                <span class="badge badge-warn">上游断电 · 电池供电中</span>
+              {% endif %}
+            </div>
+            <div class="branch-meta">
+              <span>剩余电量 <b>{{ b.ups.energy_j }} J</b> / {{ b.ups.initial_j }} J（{{ b.ups.energy_pct }}%）</span>
+              {% if b.ups.exhausted %}
+                <span class="txt-over">已于演练时钟 {{ b.ups.exhausted_at }} s 耗尽</span>
+              {% elif b.ups.draining %}
+                <span>按当前负载约 {{ b.ups.eta_s }} s 后耗尽（时钟 {{ b.ups.eta_at }} s）</span>
+              {% elif b.ups.upstream_on %}
+                <span>上游有电，电量不变</span>
+              {% else %}
+                <span>支路断开，电池待机不扣电</span>
+              {% endif %}
+            </div>
+            <div class="bar bar-energy"><i style="width: {{ b.ups.energy_pct }}%"></i></div>
+          </div>
+          {% endif %}
+
           <div class="feeds">
             {% for f in b.feeds %}
               <span class="feed {{ 'feed-dead' if not f.feed_closed }}">
@@ -129,10 +185,27 @@
             <form method="post" action="{{ url_for('ui_disconnect', branch_id=b.id) }}" class="inline">
               <button class="btn btn-danger btn-sm" type="submit">断开 {{ b.id }}</button>
             </form>
+            {% elif b.close_blocked %}
+            <button class="btn btn-primary btn-sm" type="button" disabled
+                    title="电池耗尽且上游仍断电，不能合闸">合闸 {{ b.id }}</button>
+            <span class="tiny txt-over">电池耗尽且上游断电，须先恢复上游供电</span>
             {% else %}
             <form method="post" action="{{ url_for('ui_close', branch_id=b.id) }}" class="inline">
               <button class="btn btn-primary btn-sm" type="submit">合闸 {{ b.id }}</button>
             </form>
+            {% endif %}
+            {% if b.ups %}
+              {% if b.ups.upstream_on %}
+              <form method="post" action="{{ url_for('ui_upstream', branch_id=b.id) }}" class="inline">
+                <input type="hidden" name="on" value="0">
+                <button class="btn btn-warn btn-sm" type="submit">断开上游供电</button>
+              </form>
+              {% else %}
+              <form method="post" action="{{ url_for('ui_upstream', branch_id=b.id) }}" class="inline">
+                <input type="hidden" name="on" value="1">
+                <button class="btn btn-primary btn-sm" type="submit">恢复上游供电</button>
+              </form>
+              {% endif %}
             {% endif %}
           </div>
         </article>
@@ -208,7 +281,7 @@
     <section class="card">
       <div class="card-h"><h2>本次操作 · 每轮跳闸支路</h2></div>
       {% if not v.operations %}
-        <p class="empty">尚未进行支路操作。断开推荐检修支路后，这里按轮次列出同时跳闸的支路。</p>
+        <p class="empty">尚未进行操作。断开支路 / 断开上游 / 推进时间后，这里按轮次列出跳闸与耗尽事件。</p>
       {% endif %}
       <ol class="op-list">
         {% for op in v.operations %}
@@ -219,10 +292,45 @@
             <span class="badge badge-kind">
               {% if op.kind == 'disconnect' %}人工断开
               {% elif op.kind == 'close' %}手动合闸
-              {% else %}并列合闸{% endif %}
+              {% elif op.kind == 'close_many' %}并列合闸
+              {% elif op.kind == 'upstream_off' %}断开上游
+              {% elif op.kind == 'upstream_on' %}恢复上游
+              {% else %}推进 {{ op.seconds }}s{% endif %}
             </span>
-            <span class="op-targets">{{ op.targets | join('、') }}</span>
+            <span class="op-targets">
+              {{ op.targets | join('、') }}
+              {% if op.kind == 'advance' %}演练时钟 {{ op.clock_from }}s → {{ op.clock_to }}s{% endif %}
+            </span>
           </div>
+
+          {% if op.events %}
+            <div class="events">
+              {% for ev in op.events %}
+              <div class="event">
+                <span class="event-tag">⚡ 时钟 {{ ev.at }}s · 电池耗尽</span>
+                {% for bid in ev.branches %}
+                  <span class="chip-battery">{{ bid }} 支路自动断开</span>
+                {% endfor %}
+                {% for r in ev.rounds %}
+                  <span class="round-tag">第 {{ r.index }} 轮 · 同时跳闸</span>
+                  {% for t in r.tripped %}
+                    <span class="chip-trip">
+                      {{ t.branch }}
+                      <em>{{ t.load_w }}W &gt; 上限 {{ t.capacity_w }}W</em>
+                    </span>
+                  {% endfor %}
+                {% endfor %}
+                {% for pev in ev.power_events %}
+                  {% if pev.type == 'power_lost' %}
+                    <span class="chip-off">{{ pev.server }} 两路全断 · 掉电</span>
+                  {% else %}
+                    <span class="chip-on">{{ pev.server }} 复电 · 新启动编号 #{{ pev.boot_no }}</span>
+                  {% endif %}
+                {% endfor %}
+              </div>
+              {% endfor %}
+            </div>
+          {% endif %}
 
           {% if op.rounds %}
             <div class="rounds">
@@ -239,7 +347,7 @@
               {% endfor %}
               <div class="round-note">已按剩余支路重算至无超载。跳闸支路不会自动重合，须手动合闸。</div>
             </div>
-          {% else %}
+          {% elif not op.events %}
             <div class="no-trip">本次操作未产生超载跳闸。</div>
           {% endif %}
 
@@ -286,6 +394,7 @@
   <footer class="foot">
     <p>JSON API：<code>GET /api/state</code> · <code>POST /api/branches/&lt;id&gt;/disconnect|close</code>
        · <code>POST /api/branches/close-many</code> · <code>POST /api/replicas/&lt;id&gt;/ready</code>
+       · <code>POST /api/ups/&lt;id&gt;/upstream</code> · <code>POST /api/advance</code>
        · <code>POST /api/reset</code></p>
   </footer>
 </main>

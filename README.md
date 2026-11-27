@@ -35,7 +35,7 @@ python3 app.py                        # http://127.0.0.1:8000 ，等价于 flask
 
 ## 2. 内置样例与推荐演练剧本（网页复现连锁跳闸 + 旧编号拒报）
 
-页面顶部可在两个教案间切换，并有“复位演练”。初始为健康基线：三服务器均有电、启动编号 `#1`、
+页面顶部可在三个教案间切换，并有“复位演练”。初始为健康基线：三服务器均有电、启动编号 `#1`、
 三副本就绪、绿色“集群可用”。
 
 ### 样例一（默认）· 交叉双路：同轮双跳 + 次轮连锁
@@ -76,7 +76,34 @@ WL1（2000W，带三台电源1）、WL2（3000W，带 db-1/db-2 电源2）、WL3
 - 断开 **WL2** → 第 1 轮 **WL1**（2500W > 2000W）→ 第 2 轮 **WL3**（1000W > 500W）。
 - 逐条手动合闸 **WL2 → WL1 → WL3**，每一步都不超载，三台全部复电并得到新启动编号 `#2`。
 
-两个教案都可随时“复位演练”。
+### 样例三 · UPS 续航：上游掉电后电池还能撑多久
+
+WL1、WL2 各接一台 UPS，三台副本的双路电源分别挂在两条母线支路上（单机 1000W，
+正常每条支路各带 1500W，独带时 3000W）：
+
+| 支路 | 上限 | UPS 初始电量 | 供电馈线 |
+|---|---:|---:|---|
+| **WL1** A路母线支路 | **3600 W** | **UPS-1 · 120000 J** | db-1/2/3 电源1 |
+| **WL2** B路母线支路 | **1600 W** | **UPS-2 · 30000 J** | db-1/2/3 电源2 |
+
+网页操作与预期：
+
+1. 在 WL1、WL2 卡片分别点 **“断开上游供电”**：两台 UPS 转入电池供电，
+   卡片实时显示 **剩余电量** 与 **按当前负载的预计耗尽时刻**。
+2. 在“演练时钟”卡片输入 **20** 秒点“推进时间”（或点 `+20s`）：
+   **UPS-2 在时钟 20s 耗尽（30000J ÷ 1500W），WL2 自动断开**；
+   WL1 转为独带 3000W，UPS-1 余 **90000 J**，页面显示“约 30s 后耗尽（时钟 50s）”。
+3. 再推进 **30** 秒：**UPS-1 在时钟 50s 耗尽，WL1 断开**，三副本全掉电、集群不可用。
+   复位后改为**一次推进 50 秒**，耗尽时刻（20s/50s）、剩余电量、支路状态与分次推进完全一致。
+4. 耗尽后点“合闸 WL1/WL2”或勾选并列合闸均被拒：
+   **“电池已耗尽且上游仍断电，不能合闸”**（按钮在页面上也直接禁用）。
+5. 点 WL1 的 **“恢复上游供电”**（电量不回升，本教案不模拟充电），支路不会自动合闸；
+   再手动 **“合闸 WL1”**：三副本复电、得到新启动编号 `#2`。
+6. 用当前编号给 db-1、db-2 报就绪，**2/3 → 集群恢复可用**。
+   可选教学分支：只断 WL1 上游推进 80s，WL1 耗尽断开后 WL2 独带 3000W > 1600W，
+   会在同一耗尽事件里按原超载规则跳闸。
+
+三个教案都可随时“复位演练”。
 
 ---
 
@@ -109,7 +136,31 @@ WL1（2000W，带三台电源1）、WL2（3000W，带 db-1/db-2 电源2）、WL3
 - 集群可用条件唯一：**已接受的就绪副本数 ≥ 2**。
 - 所有状态变更在同一把 `RLock` 内完成，交错并发下不会出现“旧编号被接受 / 就绪但掉电”。
 
-### 3.4 页面与接口
+### 3.4 UPS 电池与演练时钟推进（样例三）
+
+- 支路可配置一台 UPS（`branches[].ups.energy_j`，焦耳）和“上游供电”开关；
+  状态机新增 `Drill.set_upstream` 与 `Drill.advance`，演练时钟 `clock_s` 记录累计推进秒数。
+- **扣电规则**：仅“合闸 + 上游断电 + 有余量 + 确实带载”的支路耗电，
+  `电量 -= 支路负载(W) × 秒`；上游有电时电量不变；支路断开时电池待机不扣电；
+  电量只减不增（不模拟充电）。
+- **事件驱动推进**（`power_model.py: Drill.advance`）：每段内负载恒定、电量线性扣减；
+  先算出最近的耗尽时刻 `min(电量/负载)` 作为分段点，扣到该时刻后，
+  **同一时刻耗尽的支路一起断开**，再调用与人工分合闸完全相同的结算
+  （`run_cascade` 超载连锁跳闸 + 掉电/复电与启动编号），剩余时间按新负载继续扣电。
+  因为分段点只由状态决定，**分次推进与一次推进的剩余电量、支路状态、耗尽时刻严格一致**
+  （测试覆盖 20+30、7+13+30、1×50、49+1 等多种切分）。
+- **耗尽支路的合闸约束**：电池耗尽且上游仍断电的支路不能合闸——单独 `close` 与
+  并列 `close_many` 都会被 `RuleError` 拒绝（API 409 `close_blocked`，页面按钮直接禁用）；
+  恢复上游供电不自动合闸、也不给电池充电，须值班员手动合闸。
+  边界情形：上游有电时合闸的支路若电池为 0，再次断开上游会**立即**因无电源断开并结算。
+- **原子性**：一次推进的全部分段结算都在同一把 `RLock` 内完成，
+  分合闸与就绪上报只能作用于一次推进之前或完成之后的状态，并发交错下
+  “合闸且上游断电 ⇒ 必有余量”“耗尽 ⇒ 支路已断开”等不变量始终成立（有并发测试覆盖）。
+- 页面显示：每条 UPS 支路的剩余电量/百分比/能量条、上游状态徽标、
+  预计或实际**耗尽时刻**（演练时钟），以及“演练时钟”卡片的秒数推进表单；
+  操作时间线按事件展示“⚡ 时钟 Ns · 电池耗尽 → 支路自动断开 → 连锁跳闸/掉电”。
+
+### 3.5 页面与接口
 
 - `GET /`：服务端渲染的演练台（支路配电盘 + 功率条、副本卡片、每轮跳闸时间线、上报校验记录）。
 - 浏览器表单走 `/ui/...`，flash + PRG 重定向，**禁用 JS 也能完整演练**；
@@ -118,11 +169,13 @@ WL1（2000W，带三台电源1）、WL2（3000W，带 db-1/db-2 电源2）、WL3
 
 ```text
 GET  /api/state
-POST /api/reset                      {"sample":"cross|chain"}
+POST /api/reset                      {"sample":"cross|chain|ups"}
 POST /api/branches/<WL>/disconnect
 POST /api/branches/<WL>/close
 POST /api/branches/close-many        {"ids":["WL3","WL4"]}
 POST /api/replicas/<db>/ready        {"boot_no":2} 或 {"stale":true}
+POST /api/ups/<WL>/upstream          {"on":false}     （仅样例三）
+POST /api/advance                    {"seconds":30}   （仅样例三，≤86400）
 GET  /healthz
 ```
 
@@ -136,6 +189,20 @@ curl -i -X POST localhost:8000/api/replicas/db-1/ready \
 # HTTP/1.1 409 CONFLICT  "code":"stale_boot","current_boot_no":2
 ```
 
+curl 复测 UPS 续航（样例三）：
+
+```bash
+curl -s -X POST localhost:8000/api/reset -H 'Content-Type: application/json' -d '{"sample":"ups"}'
+curl -s -X POST localhost:8000/api/ups/WL1/upstream -H 'Content-Type: application/json' -d '{"on":false}'
+curl -s -X POST localhost:8000/api/ups/WL2/upstream -H 'Content-Type: application/json' -d '{"on":false}'
+curl -s -X POST localhost:8000/api/advance -H 'Content-Type: application/json' -d '{"seconds":50}'
+# events: 时钟 20s WL2 耗尽断开、时钟 50s WL1 耗尽断开；三副本掉电
+curl -i -X POST localhost:8000/api/branches/WL1/close
+# HTTP/1.1 409 CONFLICT  "code":"close_blocked"（电池耗尽且上游仍断电）
+curl -s -X POST localhost:8000/api/ups/WL1/upstream -H 'Content-Type: application/json' -d '{"on":true}'
+curl -s -X POST localhost:8000/api/branches/WL1/close   # 恢复上游后手动合闸成功
+```
+
 ---
 
 ## 4. 交付前实测结果（本仓库内真实执行）
@@ -143,34 +210,44 @@ curl -i -X POST localhost:8000/api/replicas/db-1/ready \
 执行环境：Debian 12 / Python 3.11.2；**该沙箱没有 docker CLI/daemon**，因此 Compose 的实际
 `build/up` 无法在此执行（见“余项”）。改用与镜像相同的依赖与 gunicorn 启动命令做了真机验证。
 
-1. **单元 + HTTP 测试：19/19 通过**（`python -m unittest discover -s tests`），覆盖：
+1. **单元 + HTTP 测试：35/35 通过**（`python -m unittest discover -s tests`），覆盖：
    双路平分/单路满载/两路全断、**同轮多支路同时跳闸**、多轮重算到稳定、启动编号只在完整掉复电时
-   递增、掉电与旧编号拒报、法定 2 副本、两个教案的黄金路径、并列合闸，以及
-   **8 线程 × 60 次“支路操作/随机编号上报”交错的状态不变量**。
+   递增、掉电与旧编号拒报、法定 2 副本、样例一/二黄金路径、并列合闸，
+   **8 线程 × 60 次“支路操作/随机编号上报”交错的状态不变量**；样例三新增：
+   上游有电不扣电、按负载扣电、**耗尽事件与同刻一起断开**、
+   **分次推进（20+30 / 7+13+30 / 1×50 / 49+1）与一次推进完全一致**、跨耗尽时刻的部分推进、
+   耗尽且上游断电时单独/并列合闸均被拒、恢复上游后手动合闸与就绪恢复、电量不充电、
+   断上游时电池已空立即断开、耗尽后按原规则连锁跳闸（WL2 3000W>1600W）、推进参数校验，
+   以及 **8 线程 × 50 次“推进/断合上游/分合闸/就绪上报”交错的 UPS 不变量**。
 
    ```text
-   Ran 19 tests in 1.149s
+   Ran 35 tests in 1.899s
    OK
    ```
 
-2. **对 gunicorn 实跑服务的端到端脚本：23/23 通过**
-   （`python3 scripts/e2e_check.py http://127.0.0.1:8000`，仅用标准库）：
+2. **对 gunicorn 实跑服务的端到端脚本：44/44 通过**
+   （`python3 scripts/e2e_check.py http://127.0.0.1:8000`，仅用标准库），样例三部分实测输出：
 
    ```text
-   ✅ 断开 WL1 后跳闸轮次为 [WL2,WL3] -> [WL4] 实际=[['WL2', 'WL3'], ['WL4']]
-   ✅ 连锁后 0/3 有电、集群不可用
-   ✅ 掉电中就绪上报返回 409/unpowered HTTP 409
-   ✅ 合 WL1 后 db-1/db-2 启动编号为 #2
-   ✅ 旧启动编号 #1 被拒（409/stale_boot，当前 #2） HTTP 409
-   ✅ 当前启动编号 #2 被接受
-   ✅ 仅 1/3 就绪时集群不可用
-   ✅ db-2 就绪后 2/3、集群可用
-   ✅ 单独合 WL3 因 1500W>1000W 再次跳闸
-   ✅ WL3/WL4 同时合闸成功且无跳闸；三服务器全部复电
-   ✅ db-3 用新编号 #2 就绪，3/3
-   ✅ 网页 HTML 含 '第 1 轮' 'WL2' 'WL3' '第 2 轮' '2200 W' '数据库集群可用' '旧编号' …
-   全部 23 项实测通过
+   ✅ 初始电量 UPS-1=120000J / UPS-2=30000J、上游供电中
+   ✅ 上游有电时推进 10s 电量不变、时钟前进
+   ✅ 推进 20s：UPS-2 于时钟 30s 耗尽、WL2 自动断开 实际=[(30, ['WL2'])]
+   ✅ UPS-1 余 90000J、WL1 独带 3000W、副本仍有电
+   ✅ 再推进 30s：UPS-1 于时钟 60s 耗尽、WL1 断开、全掉电 实际=[(60, ['WL1'])]
+   ✅ 耗尽且上游断电：单独合闸 WL1 被拒（409/close_blocked） HTTP 409
+   ✅ 耗尽且上游断电：并列合闸 WL1+WL2 被拒（409） HTTP 409
+   ✅ 恢复上游后手动合闸 WL1：三副本复电、新启动编号 #2
+   ✅ 恢复上游后电量不回升（UPS-1 仍为 0J）
+   ✅ db-1/db-2 用 #2 报就绪后集群恢复可用
+   ✅ 一次推进 50s：耗尽时刻 20s/50s 与分次一致 实际=[(20, ['WL2']), (50, ['WL1'])]
+   ✅ 一次推进后电量 0/0、支路全断、0/3 有电（与分次相同）
+   ✅ 网页 HTML 含 'UPS-1' '剩余电量' '演练时钟' '电池耗尽 · 自动断开'
+      '已于演练时钟 20 s 耗尽' '已于演练时钟 50 s 耗尽' '恢复上游供电' …
+   全部 44 项实测通过
    ```
+
+   （上表“时钟 30s/60s”是因该段剧本先推进过 10s 验证“上游有电不扣电”；从复位状态直接
+   断上游推进时耗尽时刻即 20s/50s。）
 
 3. **完全按网页表单契约（urlencoded + Cookie/flash）用 curl 复现**，保存渲染后 HTML 核对：
    - 断开 WL1 后：页面同时含 `第 1 轮 · 同时跳闸`、`第 2 轮 · 同时跳闸`、
@@ -181,12 +258,18 @@ curl -i -X POST localhost:8000/api/replicas/db-1/ready \
      `数据库集群可用（至少 2 副本就绪）`、`2/3 副本就绪`；
    - `POST /ui/branches/close-many`（`ids=WL3&ids=WL4`）返回 302，随后 `/api/state`
      显示 4 条支路全合、`powered_count=3`。
+   - 样例三表单流：`POST /ui/ups/WL1|WL2/upstream`（`on=0`）→ `POST /ui/advance`
+     （`seconds=20`）渲染页含 `已推进 20s（演练时钟 0s → 20s）：时钟 20s WL2 电池耗尽自动断开`、
+     `剩余电量 90000 J`、`按当前负载约 30 s 后耗尽（时钟 50 s）`；再 `seconds=30` 后页面含
+     `时钟 50s WL1 电池耗尽自动断开，掉电 db-1、db-2、db-3`、`电池耗尽 · 自动断开`、
+     合闸按钮禁用提示 `须先恢复上游供电`；表单合闸被 `电池已耗尽且上游仍断电，不能合闸：WL1`
+     拒绝；`on=1` 恢复上游后表单合闸成功、三张副本卡显示 `复电后的新启动编号`。
    - 静态资源 `style.css`、`app.js` 均 `200`。
 
 4. **交付物校验**：`compose.yaml` 与 `docker-compose.yml` 均通过 PyYAML 解析，
    端口 `8000:8000`、build context `.`、healthcheck 齐全；
    在全新目录 `pip install -r requirements.txt --target …` 成功解析安装
-   `Flask 3.1.3 / gunicorn 23.0.0 / Werkzeug 3.1.9 / Jinja2 3.1.6`；
+   `Flask 3.1.3 / gunicorn 23.0.0`；
    并用 `gunicorn --bind … --workers 1 --threads 8 app:app` 实跑通过上述全部检查。
 
 ---
@@ -207,6 +290,11 @@ curl -i -X POST localhost:8000/api/replicas/db-1/ready \
    必须 WL3/WL4 并列合闸（页面支持）或检修后更换/增容开关；样例二提供纯顺序全恢复路径。
 6. 容量恰好等于上限按“满载但不跳”处理（严格 `>` 才算超载）；若现场规程要求达到额定值即告警/跳闸，
    把 `power_model.py` 中比较改为 `>=` 并同步样例容量即可，测试中有明确用例可调整。
+7. **UPS 模型只放不放**：电池电量只减不增，不模拟上游恢复后的充电过程、电池内阻与
+   逆变器效率；推进粒度为秒（API 接受小数秒，单次上限 86400s），演练时钟随“复位演练”归零。
+   电量/时刻显示按“近整数取整、否则一位小数”格式化，内部以浮点全精度结算。
+8. 样例三中 WL2 上限 1600W 低于独带全载 3000W：只断 WL1 上游时，WL1 耗尽断开会连锁跳开 WL2
+   （同一耗尽事件内按原规则结算），这是刻意保留的教学分支，不是缺陷。
 
 ---
 
@@ -214,13 +302,13 @@ curl -i -X POST localhost:8000/api/replicas/db-1/ready \
 
 ```text
 app.py                 # Flask 路由 / JSON API / 表单 PRG / 全局锁与状态
-power_model.py         # 负载分摊、同轮同时跳闸算法、Drill 状态机与视图模型
-samples.py             # 两个内置三副本双路供电样例（容量与黄金路径）
-templates/index.html   # 演练台页面
+power_model.py         # 负载分摊、同轮同时跳闸算法、UPS 扣电与推进、Drill 状态机与视图模型
+samples.py             # 三个内置三副本双路供电样例（容量、UPS 电量与黄金路径）
+templates/index.html   # 演练台页面（支路配电盘 + UPS 面板 + 演练时钟 + 副本卡片 + 事件时间线）
 static/style.css       # 样式
 static/app.js          # 少量渐进增强 JS（无 JS 也可完整操作）
-tests/test_drill.py    # 19 个 unittest（规则 + HTTP + 并发交错）
-scripts/e2e_check.py   # 对运行中服务的 23 项端到端复测（标准库）
+tests/test_drill.py    # 35 个 unittest（规则 + UPS 推进 + HTTP + 并发交错）
+scripts/e2e_check.py   # 对运行中服务的 44 项端到端复测（标准库）
 Dockerfile             # python:3.12-slim + gunicorn 单 worker
 compose.yaml           # Docker Compose v2
 docker-compose.yml     # 等价的 v1 文件名
